@@ -105,6 +105,10 @@
   .tally small{color:var(--dim);font-size:11px;letter-spacing:.14em;text-transform:uppercase;display:block}
 
   #scatter{position:static;width:100%;height:210px;transform:none;background:#0A1018;border:1px solid var(--line);border-radius:3px}
+  #trend{position:static;width:100%;height:150px;transform:none;background:#0A1018;border:1px solid var(--line);border-radius:3px}
+  #histlist .shot{grid-template-columns:1fr 34px 42px 50px 22px}
+  .del{cursor:pointer;color:var(--dim);text-align:center}
+  .del:hover{color:var(--bad)}
 
   .shots{max-height:190px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px}
   .shot{display:grid;grid-template-columns:26px 1fr 1fr 1fr 42px;gap:6px;padding:5px 0;border-bottom:1px solid rgba(31,46,64,.5)}
@@ -191,6 +195,25 @@
         <div class="shots">
           <div class="shot head"><span>#</span><span>Elbow</span><span>Knee</span><span>Rel ht</span><span>Res</span></div>
           <div id="shotlist"></div>
+        </div>
+        <div class="controls" style="margin-top:14px">
+          <input id="sesname" placeholder="Label this session (e.g. focused, rushed, hot)"
+                 style="flex:1;min-width:180px;background:var(--panel);color:var(--chalk);
+                        border:1px solid var(--line);padding:11px;border-radius:3px;
+                        font-family:'Inter',sans-serif;font-size:13px">
+          <button id="save">Save session</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>History — consistency over time</h2>
+        <canvas id="trend"></canvas>
+        <div class="note">Lower is better. Each bar is one session's release-height spread — how much your release point wandered. Shooting percentage is the dot.</div>
+        <div class="shots" style="max-height:150px;margin-top:12px">
+          <div class="shot head" style="grid-template-columns:1fr 34px 42px 50px 22px">
+            <span>Session</span><span>N</span><span>Pct</span><span>Spread</span><span></span>
+          </div>
+          <div id="histlist"></div>
         </div>
       </div>
     </div>
@@ -798,6 +821,137 @@ document.getElementById('export').addEventListener('click', ()=>{
   a.download = 'form-lab-session.csv';
   a.click();
 });
+
+// ---- session history ------------------------------------------------------
+// Sessions persist in localStorage so you can see whether your spread is
+// actually shrinking over weeks, and compare a focused session against a
+// rushed one. Everything stays on your device.
+const STORE = 'formlab.sessions.v1';
+
+function loadHistory(){
+  try{ return JSON.parse(localStorage.getItem(STORE)) || []; }
+  catch(e){ return []; }
+}
+function saveHistory(h){
+  try{ localStorage.setItem(STORE, JSON.stringify(h)); }
+  catch(e){ alert('Could not save — browser storage may be full or blocked.'); }
+}
+
+// summarise the current session down to the numbers worth keeping
+function summarise(label){
+  const clean = shots.filter(s => Number.isFinite(s.relH) && s.relH > 1.0);
+  if (clean.length < 5) return null;
+  const done = clean.filter(s => s.result);
+  const made = done.filter(s => s.result === 'make').length;
+  return {
+    id: Date.now(),
+    label: label || new Date().toLocaleDateString(),
+    date: new Date().toISOString().slice(0,10),
+    n: clean.length,
+    labeled: done.length,
+    made,
+    pct: done.length ? made/done.length : null,
+    // the headline metric: how much the release point wandered
+    spreadH: spread(clean.map(s=>s.relH)),
+    spreadX: spread(clean.map(s=>s.relX)),
+    spreadSh: spread(clean.map(s=>s.shoulder)),
+    medH: median(clean.map(s=>s.relH))
+  };
+}
+
+document.getElementById('save').addEventListener('click', ()=>{
+  const label = document.getElementById('sesname').value.trim();
+  const s = summarise(label);
+  if (!s){ alert('Need at least 5 clean shots before saving a session.'); return; }
+  const h = loadHistory();
+  h.push(s);
+  saveHistory(h);
+  document.getElementById('sesname').value = '';
+  drawHistory();
+});
+
+function drawHistory(){
+  const h = loadHistory();
+  const list = document.getElementById('histlist');
+  list.innerHTML = h.slice().reverse().map(s=>`
+    <div class="shot">
+      <span>${s.label}</span>
+      <span>${s.n}</span>
+      <span>${s.pct!==null?Math.round(s.pct*100)+'%':'—'}</span>
+      <span>${s.spreadH.toFixed(3)}</span>
+      <span class="del" data-id="${s.id}">×</span>
+    </div>`).join('') || '<div style="color:var(--dim);padding:8px 0">No saved sessions yet.</div>';
+
+  list.querySelectorAll('.del').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      const id = Number(el.dataset.id);
+      saveHistory(loadHistory().filter(x=>x.id!==id));
+      drawHistory();
+    });
+  });
+  drawTrend(h);
+}
+
+function drawTrend(h){
+  const c = document.getElementById('trend');
+  const r = c.getBoundingClientRect();
+  c.width = r.width; c.height = r.height;
+  const g = c.getContext('2d');
+  g.clearRect(0,0,c.width,c.height);
+  if (!h.length){
+    g.fillStyle = '#7A8DA3'; g.font = "12px Inter, sans-serif";
+    g.fillText('Save a session to start tracking.', 12, 26);
+    return;
+  }
+
+  const pad = {l:34, r:34, t:14, b:26};
+  const W = c.width - pad.l - pad.r, H = c.height - pad.t - pad.b;
+  const maxS = Math.max(...h.map(s=>s.spreadH), 0.05) * 1.15;
+  const bw = Math.min(46, W / h.length * 0.62);
+
+  // spread bars — lower is better
+  h.forEach((s,i)=>{
+    const x = pad.l + (i + 0.5) * (W / h.length);
+    const bh = (s.spreadH / maxS) * H;
+    g.fillStyle = '#FFB020';
+    g.globalAlpha = 0.85;
+    g.fillRect(x - bw/2, pad.t + H - bh, bw, bh);
+    g.globalAlpha = 1;
+    g.fillStyle = '#7A8DA3';
+    g.font = "9px 'JetBrains Mono', monospace";
+    g.textAlign = 'center';
+    g.fillText(s.label.slice(0,9), x, c.height - 9);
+  });
+
+  // shooting pct as a dotted line on its own 0-100 scale
+  const pts = h.map((s,i)=>({x: pad.l + (i+0.5)*(W/h.length), p: s.pct}))
+               .filter(p=>p.p !== null);
+  if (pts.length){
+    g.strokeStyle = '#3DD68C'; g.lineWidth = 1.5; g.setLineDash([3,3]);
+    g.beginPath();
+    pts.forEach((p,i)=>{
+      const y = pad.t + H - p.p * H;
+      i ? g.lineTo(p.x,y) : g.moveTo(p.x,y);
+    });
+    g.stroke(); g.setLineDash([]);
+    g.fillStyle = '#3DD68C';
+    pts.forEach(p=>{
+      const y = pad.t + H - p.p*H;
+      g.beginPath(); g.arc(p.x,y,3.5,0,Math.PI*2); g.fill();
+    });
+  }
+
+  // axis labels
+  g.fillStyle = '#7A8DA3'; g.font = "9px 'JetBrains Mono', monospace";
+  g.textAlign = 'left';  g.fillText(maxS.toFixed(2), 4, pad.t + 8);
+  g.fillText('0', 4, pad.t + H);
+  g.textAlign = 'right'; g.fillStyle = '#3DD68C';
+  g.fillText('100%', c.width - 4, pad.t + 8);
+  g.fillText('0%', c.width - 4, pad.t + H);
+}
+
+window.addEventListener('resize', ()=>drawHistory());
+drawHistory();
 
 window.addEventListener('resize', drawScatter);
 drawScatter();
