@@ -43,6 +43,17 @@
   video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
   video{transform:scaleX(-1)}
   canvas{transform:scaleX(-1)}
+  video.unmirrored,canvas.unmirrored{transform:none}
+  video[controls]{object-fit:contain;background:#000}
+
+  input[type=file]{display:none}
+  .filebtn{
+    font-family:'Oswald',sans-serif;letter-spacing:.1em;text-transform:uppercase;
+    font-size:13px;padding:11px 18px;border-radius:3px;cursor:pointer;
+    background:transparent;color:var(--chalk);border:1px solid var(--line);
+    display:inline-block;transition:border-color .15s,color .15s;
+  }
+  .filebtn:hover{border-color:var(--amber);color:var(--amber)}
 
   .state{
     position:absolute;top:10px;left:10px;z-index:5;
@@ -125,14 +136,26 @@
       </div>
       <div class="controls">
         <button class="primary" id="start">Start camera</button>
+        <label class="filebtn" for="file">Load video file</label>
+        <input type="file" id="file" accept="video/*">
         <select id="hand">
           <option value="right">Right-handed</option>
           <option value="left">Left-handed</option>
         </select>
         <button class="make" id="make" disabled>Last was a make</button>
         <button class="miss" id="miss" disabled>Last was a miss</button>
+        <button id="voice">🎤 Voice off</button>
         <button id="clear">Clear session</button>
         <button id="export">Export CSV</button>
+      </div>
+      <div class="controls" id="scrub" style="display:none">
+        <button id="replay">Replay from start</button>
+        <select id="slow">
+          <option value="1">Normal speed</option>
+          <option value="0.5">Half speed</option>
+          <option value="0.25">Quarter speed</option>
+        </select>
+        <span id="filename" style="color:var(--dim);font-size:12px;align-self:center"></span>
       </div>
     </div>
 
@@ -145,7 +168,10 @@
         <div class="metric"><span class="label">Release height</span><span><span class="val" id="m-rel">—</span><span class="delta" id="d-rel"></span></span></div>
         <div class="metric"><span class="label">Shoulder at release</span><span><span class="val" id="m-sh">—</span><span class="delta" id="d-sh"></span></span></div>
         <div class="metric"><span class="label">Elbow drift</span><span><span class="val" id="m-drift">—</span><span class="delta" id="d-drift"></span></span></div>
-        <div class="note">Deltas compare this rep to <b>your own median</b> this session, not to a pro. Amber means it's outside your usual band.</div>
+        <div class="note">Deltas compare this rep to <b>your own median</b> this session, not to a pro. Amber means it's outside your usual band.<br><br>
+        Detector: <span id="rejects" style="color:var(--amber);font-family:'JetBrains Mono',monospace">0 accepted · 0 rejected</span><br>
+        Dribbles and rebounds get thrown out — the frame flashes amber when a shot is actually logged.<br><br>
+        <span id="voicehint">Voice labeling is off.</span></div>
       </div>
 
       <div class="panel">
@@ -245,47 +271,88 @@ function snapshot(lm){
 }
 
 // ---- shot segmentation ----------------------------------------------------
-// Buffer frames while the wrist is above the hip. When it drops back down,
-// the buffer holds one complete attempt: find the dip (lowest wrist) and the
-// release (most extended elbow while the wrist is above the shoulder).
+// v2. The first version let dribbles through: it only asked that the wrist rise
+// above the hip and come back down, which a chest-height dribble does all day.
+// A real shot has a signature a dribble cannot fake:
+//   1. the wrist goes ABOVE THE HEAD (dribbles never do)
+//   2. the elbow LOADS (flexes past ~110°) and then EXTENDS (past ~150°)
+//   3. it takes long enough to be a shooting motion, not a flick
+// All three must hold or the buffer is discarded.
+const GATE = {
+  minFrames: 12,        // ~0.4s at 30fps
+  maxFrames: 150,       // anything longer isn't one shot
+  aboveHead: true,      // wrist must clear the nose
+  loadBelow: 115,       // elbow must flex at least this far
+  extendAbove: 145,     // and then extend at least this far
+  cooldownMs: 600       // ignore re-triggers right after a shot
+};
+
+let lastShotAt = 0;
+let peaked = false;     // did the wrist clear the head during this buffer?
+
 function segment(f){
   const s = side();
-  const wristAboveHip = f.wristH > 0.15;
-  const wristAboveShoulder = f.lm[s.wr].y < f.shoulderY;
+  const wristAboveHip  = f.wristH > 0.15;
+  const wristAboveHead = f.lm[s.wr].y < f.lm[L.nose].y;
 
   if (phase === 'idle'){
-    if (wristAboveHip){ phase = 'rising'; buffer = [f]; }
+    // require the wrist to be genuinely low before arming, so we start the
+    // buffer at the bottom of the motion rather than partway up
+    if (wristAboveHip) return;
+    phase = 'armed'; buffer = []; peaked = false;
+    return;
+  }
+
+  if (phase === 'armed'){
+    buffer.push(f);
+    if (wristAboveHip){ phase = 'rising'; }
+    else if (buffer.length > 30) buffer = [f];   // idling low, keep it short
     return;
   }
 
   buffer.push(f);
-  if (buffer.length > 200) buffer.shift();   // safety valve
+  if (wristAboveHead) peaked = true;
 
-  if (phase === 'rising' && wristAboveShoulder) phase = 'descending';
+  if (buffer.length > GATE.maxFrames){            // ran too long, bail out
+    phase = 'idle'; buffer = []; peaked = false;
+    return;
+  }
 
-  // shot ends when the wrist comes back down past the hip
-  if (phase === 'descending' && !wristAboveHip){
+  // motion ends when the wrist drops back below the hip
+  if (!wristAboveHip){
     finalize(buffer);
-    phase = 'idle';
-    buffer = [];
+    phase = 'idle'; buffer = []; peaked = false;
   }
 }
 
 function finalize(buf){
-  if (buf.length < 8) return;                         // too short to be a shot
+  rejected.total++;
 
-  // dip = lowest wrist position in the first 60% of the motion
-  const dipZone = buf.slice(0, Math.max(3, Math.floor(buf.length*0.6)));
-  let dip = dipZone[0];
-  for (const f of dipZone) if (f.wristH < dip.wristH) dip = f;
+  if (buf.length < GATE.minFrames){ rejected.tooShort++; return; }
+  if (GATE.aboveHead && !peaked)  { rejected.noPeak++;   return; }
+  if (performance.now() - lastShotAt < GATE.cooldownMs){ rejected.cooldown++; return; }
 
-  // release = maximum elbow extension among frames where the wrist is high
   const s = side();
-  const high = buf.filter(f => f.lm[s.wr].y < f.shoulderY);
-  if (!high.length) return;
-  let rel = high[0];
-  for (const f of high) if (f.elbow > rel.elbow) rel = f;
 
+  // release = max elbow extension among frames with the wrist above the head
+  const high = buf.filter(f => f.lm[s.wr].y < f.lm[L.nose].y);
+  if (!high.length){ rejected.noPeak++; return; }
+  let rel = high[0], relIdx = 0;
+  buf.forEach((f,i)=>{ if (f.lm[s.wr].y < f.lm[L.nose].y && f.elbow > rel.elbow){ rel = f; relIdx = i; } });
+
+  // dip = MAXIMUM ELBOW FLEXION before release. This is the fix: v1 used the
+  // lowest wrist position, which lands on arbitrary frames. Peak flexion is the
+  // loaded position the biomechanics literature actually measures.
+  const pre = buf.slice(0, Math.max(2, relIdx));
+  let dip = pre[0];
+  for (const f of pre) if (f.elbow < dip.elbow) dip = f;
+
+  // the load-and-extend signature
+  if (!(dip.elbow < GATE.loadBelow)){ rejected.noLoad++; return; }
+  if (!(rel.elbow > GATE.extendAbove)){ rejected.noExtend++; return; }
+  if (!Number.isFinite(dip.knee) || !Number.isFinite(rel.forearm)){ rejected.badFrame++; return; }
+
+  lastShotAt = performance.now();
   const shot = {
     n: shots.length + 1,
     elbow: dip.elbow,
@@ -295,10 +362,22 @@ function finalize(buf){
     relX: rel.wristX,
     shoulder: rel.shoulder,
     drift: dip.drift,
+    frames: buf.length,
     result: null
   };
   shots.push(shot);
   render(shot);
+  flash();
+}
+
+const rejected = {total:0, tooShort:0, noPeak:0, noLoad:0, noExtend:0, cooldown:0, badFrame:0};
+
+function flash(){
+  const el = document.querySelector('.stage');
+  el.style.outline = '3px solid var(--amber)';
+  setTimeout(()=>{ el.style.outline = 'none'; }, 220);
+  const r = document.getElementById('rejects');
+  if (r) r.textContent = `${shots.length} accepted · ${rejected.total - shots.length} rejected`;
 }
 
 // ---- stats ----------------------------------------------------------------
@@ -452,8 +531,8 @@ function loop(){
       const f = snapshot(lm);
       if (Number.isFinite(f.elbow)){
         segment(f);
-        setState(phase === 'idle' ? 'Tracking' : 'Shot in progress',
-                 phase === 'idle' ? 'armed' : 'live');
+        setState(phase === 'rising' ? 'Shot in progress' : 'Tracking',
+                 phase === 'rising' ? 'live' : 'armed');
       }
     } else {
       setState('No body detected', '');
@@ -463,10 +542,10 @@ function loop(){
 }
 
 // ---- wiring ---------------------------------------------------------------
-document.getElementById('start').addEventListener('click', async e => {
-  const btn = e.currentTarget;
-  btn.disabled = true; btn.textContent = 'Loading model…';
-  try{
+let modelReady = null;
+function loadModel(){
+  if (modelReady) return modelReady;
+  modelReady = (async ()=>{
     const vision = await FilesetResolver.forVisionTasks(
       "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
     landmarker = await PoseLandmarker.createFromOptions(vision, {
@@ -476,37 +555,191 @@ document.getElementById('start').addEventListener('click', async e => {
       },
       runningMode:"VIDEO", numPoses:1
     });
+  })();
+  return modelReady;
+}
+
+function resetSegmenter(){
+  buffer = []; phase = 'idle'; peaked = false; lastT = -1;
+}
+
+document.getElementById('start').addEventListener('click', async e => {
+  const btn = e.currentTarget;
+  btn.disabled = true; btn.textContent = 'Loading model…';
+  try{
+    await loadModel();
     const stream = await navigator.mediaDevices.getUserMedia({
       video:{ width:{ideal:1280}, height:{ideal:960}, facingMode:"environment" }
     });
     vid.srcObject = stream;
+    vid.loop = false; vid.muted = true; vid.controls = false;
+    vid.classList.remove('unmirrored'); cv.classList.remove('unmirrored');
     await vid.play();
     document.getElementById('hint').style.display = 'none';
-    btn.textContent = 'Running';
+    document.getElementById('scrub').style.display = 'none';
+    btn.textContent = 'Running'; sourceIsFile = false;
+    resetSegmenter();
     running = true; setState('Tracking','armed'); loop();
   }catch(err){
     btn.disabled = false; btn.textContent = 'Start camera';
-    setState('Camera or model failed to load','');
+    setState('Camera failed','');
     document.getElementById('hint').innerHTML =
       "Couldn't start. Camera access needs HTTPS and permission — check the browser prompt, then try again.<br><br><code>"+err.message+"</code>";
   }
 });
 
+// ---- video file source ----------------------------------------------------
+// Same pipeline, different pixel source. Filmed clips are usually NOT mirrored
+// the way a selfie feed is, so the mirror transform gets removed for files.
+let sourceIsFile = false;
+
+document.getElementById('file').addEventListener('change', async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const status = document.getElementById('filename');
+  status.textContent = 'Loading model…';
+  try{
+    await loadModel();
+    if (vid.srcObject){                        // stop any live camera first
+      vid.srcObject.getTracks().forEach(t=>t.stop());
+      vid.srcObject = null;
+    }
+    running = false;
+    vid.src = URL.createObjectURL(f);
+    vid.loop = false; vid.muted = true; vid.controls = true;
+    vid.classList.add('unmirrored'); cv.classList.add('unmirrored');
+    sourceIsFile = true;
+    document.getElementById('hint').style.display = 'none';
+    document.getElementById('scrub').style.display = 'flex';
+    document.getElementById('start').textContent = 'Start camera';
+    document.getElementById('start').disabled = false;
+    status.textContent = f.name;
+    await vid.play();
+    resetSegmenter();
+    running = true; setState('Reading video','live'); loop();
+  }catch(err){
+    status.textContent = 'Failed: ' + err.message;
+  }
+});
+
+document.getElementById('replay').addEventListener('click', ()=>{
+  if (!sourceIsFile) return;
+  resetSegmenter();
+  vid.currentTime = 0;
+  vid.play();
+  running = true; setState('Reading video','live'); loop();
+});
+
+document.getElementById('slow').addEventListener('change', e => {
+  vid.playbackRate = parseFloat(e.target.value);
+});
+
+vid.addEventListener('ended', ()=>{
+  if (sourceIsFile){ setState('Video finished','armed'); }
+});
+
 document.getElementById('hand').addEventListener('change', e => hand = e.target.value);
 
 function mark(result){
-  const last = shots[shots.length-1];
-  if (!last) return;
-  last.result = result;
+  // label the most recent shot that doesn't have one yet, not blindly the last.
+  // if you say "make" a beat late and another shot already logged, this still
+  // lands on the right one.
+  let target = null;
+  for (let i = shots.length-1; i >= 0 && i >= shots.length-3; i--){
+    if (shots[i].result === null){ target = shots[i]; break; }
+  }
+  if (!target) target = shots[shots.length-1];
+  if (!target) return;
+  target.result = result;
   document.getElementById('make').disabled = true;
   document.getElementById('miss').disabled = true;
   drawScatter(); drawList(); drawTally();
+  return target;
 }
 document.getElementById('make').addEventListener('click', ()=>mark('make'));
 document.getElementById('miss').addEventListener('click', ()=>mark('miss'));
 
+// ---- voice labeling -------------------------------------------------------
+// Walking back to the phone after every rep is why the first session ended up
+// half-labeled. Say the word instead. Browser SpeechRecognition does the work;
+// a short beep confirms so you never have to look at the screen.
+let recog = null, voiceOn = false;
+let audioCtx = null;
+
+function beep(freq, ms){
+  try{
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.frequency.value = freq; o.type = 'sine';
+    g.gain.setValueAtTime(0.18, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + ms/1000);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + ms/1000);
+  }catch(e){}
+}
+
+// generous synonyms — you will not say the exact word every time from 20 feet
+const MAKE_WORDS = ['make','made','makes','in','yes','good','bucket','swish','cash','money','count'];
+const MISS_WORDS = ['miss','missed','misses','no','off','brick','out','nope'];
+
+function heard(text){
+  const words = text.toLowerCase().replace(/[^a-z ]/g,'').split(/\s+/);
+  for (const w of words){
+    if (MAKE_WORDS.includes(w)){ if (mark('make')) beep(880,120); return; }
+    if (MISS_WORDS.includes(w)){ if (mark('miss')) beep(300,160); return; }
+  }
+}
+
+function setVoiceUI(on, msg){
+  const b = document.getElementById('voice');
+  b.textContent = on ? '🎤 Listening' : '🎤 Voice off';
+  b.style.borderColor = on ? 'var(--good)' : 'var(--line)';
+  b.style.color = on ? 'var(--good)' : 'var(--chalk)';
+  const v = document.getElementById('voicehint');
+  if (v) v.textContent = msg || (on
+    ? 'Say "make" or "miss" after each shot. High beep = make, low beep = miss.'
+    : 'Voice labeling is off.');
+}
+
+document.getElementById('voice').addEventListener('click', ()=>{
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR){
+    setVoiceUI(false, 'This browser has no speech recognition. Chrome on Android or Safari on iOS work; Firefox does not.');
+    return;
+  }
+  if (voiceOn){
+    voiceOn = false; if (recog) recog.stop(); setVoiceUI(false);
+    return;
+  }
+  recog = new SR();
+  recog.continuous = true;
+  recog.interimResults = false;
+  recog.lang = 'en-US';
+  recog.onresult = e => {
+    for (let i = e.resultIndex; i < e.results.length; i++){
+      heard(e.results[i][0].transcript);
+    }
+  };
+  // recognition drops out on its own every 30-60s; restart it while voiceOn
+  recog.onend = () => { if (voiceOn){ try{ recog.start(); }catch(e){} } };
+  recog.onerror = ev => {
+    if (ev.error === 'not-allowed'){
+      voiceOn = false;
+      setVoiceUI(false, 'Microphone permission denied. Allow it in the browser prompt and try again.');
+    }
+  };
+  try{
+    recog.start(); voiceOn = true; setVoiceUI(true); beep(660,90);
+  }catch(err){
+    setVoiceUI(false, 'Could not start: ' + err.message);
+  }
+});
+
 document.getElementById('clear').addEventListener('click', ()=>{
-  shots = []; buffer = []; phase = 'idle';
+  shots = []; buffer = []; phase = 'idle'; peaked = false;
+  Object.keys(rejected).forEach(k => rejected[k] = 0);
+  const rj = document.getElementById('rejects');
+  if (rj) rj.textContent = '0 accepted · 0 rejected';
   ['elbow','knee','fore','rel','sh','drift'].forEach(id=>{
     document.getElementById('m-'+id).textContent = '—';
     document.getElementById('m-'+id).classList.remove('off');
