@@ -1,0 +1,533 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Form Lab — free throw mechanics</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@300;500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+
+<style>
+  :root{
+    --night:#0A1018;
+    --panel:#111A26;
+    --line:#1F2E40;
+    --chalk:#E8EDF4;
+    --dim:#7A8DA3;
+    --amber:#FFB020;
+    --good:#3DD68C;
+    --bad:#F2545B;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:var(--night); color:var(--chalk);
+    font-family:'Inter',system-ui,sans-serif;
+    padding:20px; min-height:100vh;
+  }
+  .wrap{max-width:1100px;margin:0 auto}
+
+  header{
+    display:flex;align-items:baseline;gap:14px;
+    border-bottom:2px solid var(--line);padding-bottom:14px;margin-bottom:22px;
+    flex-wrap:wrap;
+  }
+  h1{
+    font-family:'Oswald',sans-serif;font-weight:700;
+    font-size:clamp(28px,5vw,44px);letter-spacing:.04em;text-transform:uppercase;
+  }
+  h1 span{color:var(--amber)}
+  .tag{color:var(--dim);font-size:13px;letter-spacing:.14em;text-transform:uppercase}
+
+  .grid{display:grid;grid-template-columns:1.35fr 1fr;gap:20px}
+  @media(max-width:860px){.grid{grid-template-columns:1fr}}
+
+  .stage{position:relative;background:#000;border:1px solid var(--line);border-radius:4px;overflow:hidden;aspect-ratio:4/3}
+  video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  video{transform:scaleX(-1)}
+  canvas{transform:scaleX(-1)}
+
+  .state{
+    position:absolute;top:10px;left:10px;z-index:5;
+    font-family:'Oswald',sans-serif;letter-spacing:.16em;text-transform:uppercase;
+    font-size:12px;padding:5px 11px;border:1px solid var(--line);
+    background:rgba(10,16,24,.82);border-radius:2px;color:var(--dim);
+  }
+  .state.armed{color:var(--amber);border-color:var(--amber)}
+  .state.live{color:var(--good);border-color:var(--good)}
+
+  .hint{
+    position:absolute;inset:0;display:grid;place-content:center;text-align:center;
+    padding:26px;color:var(--dim);font-size:14px;line-height:1.7;z-index:4;
+  }
+
+  .controls{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+  button{
+    font-family:'Oswald',sans-serif;letter-spacing:.1em;text-transform:uppercase;
+    font-size:13px;padding:11px 18px;border-radius:3px;cursor:pointer;
+    background:transparent;color:var(--chalk);border:1px solid var(--line);
+    transition:border-color .15s,color .15s;
+  }
+  button:hover:not(:disabled){border-color:var(--amber);color:var(--amber)}
+  button:disabled{opacity:.35;cursor:not-allowed}
+  button.primary{background:var(--amber);color:#0A1018;border-color:var(--amber);font-weight:700}
+  button.primary:hover{color:#0A1018;filter:brightness(1.1)}
+  button.make{border-color:var(--good);color:var(--good)}
+  button.miss{border-color:var(--bad);color:var(--bad)}
+  select{
+    background:var(--panel);color:var(--chalk);border:1px solid var(--line);
+    padding:11px;border-radius:3px;font-family:'Inter',sans-serif;font-size:13px;
+  }
+
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:18px;margin-bottom:16px}
+  .panel h2{
+    font-family:'Oswald',sans-serif;font-weight:500;font-size:12px;
+    letter-spacing:.2em;text-transform:uppercase;color:var(--dim);
+    margin-bottom:14px;padding-bottom:9px;border-bottom:1px solid var(--line);
+  }
+
+  .metric{display:flex;justify-content:space-between;align-items:baseline;padding:7px 0}
+  .metric .label{font-size:13px;color:var(--dim)}
+  .metric .val{font-family:'JetBrains Mono',monospace;font-size:19px;font-weight:700}
+  .metric .val.off{color:var(--amber)}
+  .metric .delta{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--dim);margin-left:8px}
+
+  .tally{display:flex;gap:22px;align-items:baseline;margin-bottom:6px}
+  .tally b{font-family:'JetBrains Mono',monospace;font-size:32px;font-weight:700}
+  .tally small{color:var(--dim);font-size:11px;letter-spacing:.14em;text-transform:uppercase;display:block}
+
+  #scatter{position:static;width:100%;height:210px;transform:none;background:#0A1018;border:1px solid var(--line);border-radius:3px}
+
+  .shots{max-height:190px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px}
+  .shot{display:grid;grid-template-columns:26px 1fr 1fr 1fr 42px;gap:6px;padding:5px 0;border-bottom:1px solid rgba(31,46,64,.5)}
+  .shot.head{color:var(--dim);font-size:9px;letter-spacing:.1em;text-transform:uppercase;position:sticky;top:0;background:var(--panel)}
+  .shot .m{color:var(--good)}
+  .shot .x{color:var(--bad)}
+
+  .note{font-size:12px;color:var(--dim);line-height:1.65;margin-top:12px}
+  .note code{font-family:'JetBrains Mono',monospace;color:var(--amber);font-size:11px}
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Form <span>Lab</span></h1>
+    <div class="tag">Free throw · sagittal plane · phase 1</div>
+  </header>
+
+  <div class="grid">
+    <div>
+      <div class="stage">
+        <video id="vid" autoplay playsinline muted></video>
+        <canvas id="cv"></canvas>
+        <div class="state" id="state">Camera off</div>
+        <div class="hint" id="hint">
+          Set the phone or laptop on your <b>shooting-hand side</b>, roughly hip height,
+          8–12 feet away.<br>Your whole body needs to be in frame.<br><br>
+          Shots are cut automatically — shoot normally.
+        </div>
+      </div>
+      <div class="controls">
+        <button class="primary" id="start">Start camera</button>
+        <select id="hand">
+          <option value="right">Right-handed</option>
+          <option value="left">Left-handed</option>
+        </select>
+        <button class="make" id="make" disabled>Last was a make</button>
+        <button class="miss" id="miss" disabled>Last was a miss</button>
+        <button id="clear">Clear session</button>
+        <button id="export">Export CSV</button>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h2>Last shot</h2>
+        <div class="metric"><span class="label">Elbow flexion at dip</span><span><span class="val" id="m-elbow">—</span><span class="delta" id="d-elbow"></span></span></div>
+        <div class="metric"><span class="label">Knee flexion at dip</span><span><span class="val" id="m-knee">—</span><span class="delta" id="d-knee"></span></span></div>
+        <div class="metric"><span class="label">Forearm from vertical</span><span><span class="val" id="m-fore">—</span><span class="delta" id="d-fore"></span></span></div>
+        <div class="metric"><span class="label">Release height</span><span><span class="val" id="m-rel">—</span><span class="delta" id="d-rel"></span></span></div>
+        <div class="metric"><span class="label">Shoulder at release</span><span><span class="val" id="m-sh">—</span><span class="delta" id="d-sh"></span></span></div>
+        <div class="metric"><span class="label">Elbow drift</span><span><span class="val" id="m-drift">—</span><span class="delta" id="d-drift"></span></span></div>
+        <div class="note">Deltas compare this rep to <b>your own median</b> this session, not to a pro. Amber means it's outside your usual band.</div>
+      </div>
+
+      <div class="panel">
+        <h2>Consistency — release point scatter</h2>
+        <canvas id="scatter"></canvas>
+        <div class="note">Each dot is one release, normalized by torso length so moving the camera doesn't shift it. Tight cluster is the goal. Spread: <span id="spread" style="color:var(--amber);font-family:'JetBrains Mono',monospace">—</span></div>
+      </div>
+
+      <div class="panel">
+        <h2>Session</h2>
+        <div class="tally">
+          <div><b id="t-total">0</b><small>Shots</small></div>
+          <div><b id="t-made" style="color:var(--good)">0</b><small>Made</small></div>
+          <div><b id="t-pct">—</b><small>Pct</small></div>
+        </div>
+        <div class="shots">
+          <div class="shot head"><span>#</span><span>Elbow</span><span>Knee</span><span>Rel ht</span><span>Res</span></div>
+          <div id="shotlist"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://esm.sh/@mediapipe/tasks-vision@0.10.14";
+
+const vid = document.getElementById('vid');
+const cv  = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const scat = document.getElementById('scatter');
+const sctx = scat.getContext('2d');
+const stateEl = document.getElementById('hint') && document.getElementById('state');
+
+let landmarker = null, running = false, hand = 'right';
+let buffer = [];          // frames of the current shot attempt
+let phase = 'idle';       // idle | rising | descending
+let shots = [];
+let lastT = -1;
+
+// MediaPipe BlazePose landmark indices
+const L = {
+  nose:0,
+  lShoulder:11, rShoulder:12, lElbow:13, rElbow:14, lWrist:15, rWrist:16,
+  lHip:23, rHip:24, lKnee:25, rKnee:26, lAnkle:27, rAnkle:28
+};
+
+function side(){
+  return hand === 'right'
+    ? {sh:L.rShoulder, el:L.rElbow, wr:L.rWrist, hip:L.rHip, kn:L.rKnee, an:L.rAnkle}
+    : {sh:L.lShoulder, el:L.lElbow, wr:L.lWrist, hip:L.lHip, kn:L.lKnee, an:L.lAnkle};
+}
+
+// ---- geometry -------------------------------------------------------------
+// Interior angle at joint b, formed by segments b->a and b->c. Returns degrees.
+function angleAt(a, b, c){
+  const v1 = {x:a.x-b.x, y:a.y-b.y};
+  const v2 = {x:c.x-b.x, y:c.y-b.y};
+  const dot = v1.x*v2.x + v1.y*v2.y;
+  const m1 = Math.hypot(v1.x, v1.y), m2 = Math.hypot(v2.x, v2.y);
+  if (m1 === 0 || m2 === 0) return NaN;
+  return Math.acos(Math.max(-1, Math.min(1, dot/(m1*m2)))) * 180/Math.PI;
+}
+
+// Angle of segment b->a away from straight-up. 0 = perfectly vertical.
+function fromVertical(a, b){
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;          // screen y grows downward
+  return Math.abs(Math.atan2(dx, -dy) * 180/Math.PI);
+}
+
+// Torso length = shoulder to hip. Every distance gets divided by this so the
+// numbers hold still when the tripod moves.
+function torso(lm, s){
+  return Math.hypot(lm[s.sh].x - lm[s.hip].x, lm[s.sh].y - lm[s.hip].y);
+}
+
+// ---- per-frame feature snapshot ------------------------------------------
+function snapshot(lm){
+  const s = side();
+  const t = torso(lm, s) || 1e-6;
+  return {
+    lm,
+    t,
+    elbow:    angleAt(lm[s.sh], lm[s.el], lm[s.wr]),   // smaller = more flexed
+    knee:     angleAt(lm[s.hip], lm[s.kn], lm[s.an]),
+    shoulder: angleAt(lm[s.hip], lm[s.sh], lm[s.el]),
+    forearm:  fromVertical(lm[s.wr], lm[s.el]),
+    // heights measured upward from the hip, in torso units
+    wristH:   (lm[s.hip].y - lm[s.wr].y) / t,
+    elbowH:   (lm[s.hip].y - lm[s.el].y) / t,
+    // horizontal gap between elbow and shoulder — the "flare" proxy
+    drift:    (lm[s.el].x - lm[s.sh].x) / t,
+    wristX:   (lm[s.wr].x - lm[s.sh].x) / t,
+    shoulderY: lm[s.sh].y
+  };
+}
+
+// ---- shot segmentation ----------------------------------------------------
+// Buffer frames while the wrist is above the hip. When it drops back down,
+// the buffer holds one complete attempt: find the dip (lowest wrist) and the
+// release (most extended elbow while the wrist is above the shoulder).
+function segment(f){
+  const s = side();
+  const wristAboveHip = f.wristH > 0.15;
+  const wristAboveShoulder = f.lm[s.wr].y < f.shoulderY;
+
+  if (phase === 'idle'){
+    if (wristAboveHip){ phase = 'rising'; buffer = [f]; }
+    return;
+  }
+
+  buffer.push(f);
+  if (buffer.length > 200) buffer.shift();   // safety valve
+
+  if (phase === 'rising' && wristAboveShoulder) phase = 'descending';
+
+  // shot ends when the wrist comes back down past the hip
+  if (phase === 'descending' && !wristAboveHip){
+    finalize(buffer);
+    phase = 'idle';
+    buffer = [];
+  }
+}
+
+function finalize(buf){
+  if (buf.length < 8) return;                         // too short to be a shot
+
+  // dip = lowest wrist position in the first 60% of the motion
+  const dipZone = buf.slice(0, Math.max(3, Math.floor(buf.length*0.6)));
+  let dip = dipZone[0];
+  for (const f of dipZone) if (f.wristH < dip.wristH) dip = f;
+
+  // release = maximum elbow extension among frames where the wrist is high
+  const s = side();
+  const high = buf.filter(f => f.lm[s.wr].y < f.shoulderY);
+  if (!high.length) return;
+  let rel = high[0];
+  for (const f of high) if (f.elbow > rel.elbow) rel = f;
+
+  const shot = {
+    n: shots.length + 1,
+    elbow: dip.elbow,
+    knee: dip.knee,
+    forearm: rel.forearm,
+    relH: rel.wristH,
+    relX: rel.wristX,
+    shoulder: rel.shoulder,
+    drift: dip.drift,
+    result: null
+  };
+  shots.push(shot);
+  render(shot);
+}
+
+// ---- stats ----------------------------------------------------------------
+const median = a => {
+  const v = a.filter(Number.isFinite).sort((x,y)=>x-y);
+  if (!v.length) return NaN;
+  const m = Math.floor(v.length/2);
+  return v.length % 2 ? v[m] : (v[m-1]+v[m])/2;
+};
+const spread = a => {
+  const v = a.filter(Number.isFinite);
+  if (v.length < 2) return NaN;
+  const mu = v.reduce((s,x)=>s+x,0)/v.length;
+  return Math.sqrt(v.reduce((s,x)=>s+(x-mu)**2,0)/v.length);
+};
+
+function setMetric(id, val, unit, arr, tol){
+  const el = document.getElementById('m-'+id);
+  const dl = document.getElementById('d-'+id);
+  if (!Number.isFinite(val)){ el.textContent = '—'; dl.textContent=''; return; }
+  el.textContent = val.toFixed(unit === '°' ? 0 : 2) + unit;
+  if (arr.length < 4){ dl.textContent = ''; el.classList.remove('off'); return; }
+  const med = median(arr.slice(0,-1));
+  const d = val - med;
+  dl.textContent = (d >= 0 ? '+' : '') + d.toFixed(unit === '°' ? 0 : 2);
+  el.classList.toggle('off', Math.abs(d) > tol);
+}
+
+function render(shot){
+  const all = shots;
+  setMetric('elbow', shot.elbow, '°', all.map(s=>s.elbow), 8);
+  setMetric('knee',  shot.knee,  '°', all.map(s=>s.knee), 8);
+  setMetric('fore',  shot.forearm,'°', all.map(s=>s.forearm), 7);
+  setMetric('rel',   shot.relH,  '',  all.map(s=>s.relH), 0.10);
+  setMetric('sh',    shot.shoulder,'°',all.map(s=>s.shoulder), 8);
+  setMetric('drift', shot.drift, '',  all.map(s=>s.drift), 0.10);
+
+  document.getElementById('make').disabled = false;
+  document.getElementById('miss').disabled = false;
+  drawScatter();
+  drawList();
+  drawTally();
+}
+
+function drawTally(){
+  const done = shots.filter(s=>s.result !== null);
+  const made = done.filter(s=>s.result === 'make').length;
+  document.getElementById('t-total').textContent = shots.length;
+  document.getElementById('t-made').textContent = made;
+  document.getElementById('t-pct').textContent = done.length
+    ? Math.round(made/done.length*100)+'%' : '—';
+}
+
+function drawList(){
+  document.getElementById('shotlist').innerHTML = shots.slice().reverse().map(s=>`
+    <div class="shot">
+      <span>${s.n}</span>
+      <span>${Number.isFinite(s.elbow)?s.elbow.toFixed(0)+'°':'—'}</span>
+      <span>${Number.isFinite(s.knee)?s.knee.toFixed(0)+'°':'—'}</span>
+      <span>${Number.isFinite(s.relH)?s.relH.toFixed(2):'—'}</span>
+      <span class="${s.result==='make'?'m':s.result==='miss'?'x':''}">${s.result==='make'?'●':s.result==='miss'?'○':'·'}</span>
+    </div>`).join('');
+}
+
+function drawScatter(){
+  const r = scat.getBoundingClientRect();
+  scat.width = r.width; scat.height = r.height;
+  sctx.clearRect(0,0,scat.width,scat.height);
+
+  const pts = shots.filter(s=>Number.isFinite(s.relH) && Number.isFinite(s.relX));
+  if (!pts.length) return;
+
+  const mx = median(pts.map(p=>p.relX));
+  const my = median(pts.map(p=>p.relH));
+  const scale = 260;
+  const cx = scat.width/2, cy = scat.height/2;
+
+  // reference rings at 0.1 and 0.2 torso units from your own median
+  sctx.strokeStyle = '#1F2E40';
+  for (const r0 of [0.1, 0.2]){
+    sctx.beginPath();
+    sctx.arc(cx, cy, r0*scale, 0, Math.PI*2);
+    sctx.stroke();
+  }
+  sctx.strokeStyle = '#16202E';
+  sctx.beginPath(); sctx.moveTo(cx,0); sctx.lineTo(cx,scat.height);
+  sctx.moveTo(0,cy); sctx.lineTo(scat.width,cy); sctx.stroke();
+
+  pts.forEach((p,i)=>{
+    const x = cx + (p.relX - mx)*scale;
+    const y = cy - (p.relH - my)*scale;
+    const fresh = i >= pts.length-1;
+    sctx.fillStyle = p.result === 'make' ? '#3DD68C'
+                   : p.result === 'miss' ? '#F2545B' : '#7A8DA3';
+    sctx.globalAlpha = fresh ? 1 : 0.65;
+    sctx.beginPath(); sctx.arc(x, y, fresh ? 5.5 : 3.5, 0, Math.PI*2); sctx.fill();
+    if (fresh){ sctx.strokeStyle='#FFB020'; sctx.lineWidth=1.5; sctx.stroke(); }
+  });
+  sctx.globalAlpha = 1;
+
+  const sx = spread(pts.map(p=>p.relX)), sy = spread(pts.map(p=>p.relH));
+  document.getElementById('spread').textContent =
+    Number.isFinite(sx) ? `±${sx.toFixed(3)} horiz · ±${sy.toFixed(3)} vert` : '—';
+}
+
+// ---- drawing --------------------------------------------------------------
+const BONES = [[11,13],[13,15],[12,14],[14,16],[11,12],[11,23],[12,24],[23,24],
+               [23,25],[25,27],[24,26],[26,28]];
+
+function draw(lm){
+  cv.width = vid.videoWidth; cv.height = vid.videoHeight;
+  ctx.clearRect(0,0,cv.width,cv.height);
+  const s = side();
+
+  ctx.strokeStyle = 'rgba(232,237,244,.55)'; ctx.lineWidth = 3;
+  for (const [a,b] of BONES){
+    ctx.beginPath();
+    ctx.moveTo(lm[a].x*cv.width, lm[a].y*cv.height);
+    ctx.lineTo(lm[b].x*cv.width, lm[b].y*cv.height);
+    ctx.stroke();
+  }
+  // highlight the shooting arm
+  ctx.strokeStyle = '#FFB020'; ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.moveTo(lm[s.sh].x*cv.width, lm[s.sh].y*cv.height);
+  ctx.lineTo(lm[s.el].x*cv.width, lm[s.el].y*cv.height);
+  ctx.lineTo(lm[s.wr].x*cv.width, lm[s.wr].y*cv.height);
+  ctx.stroke();
+
+  ctx.fillStyle = '#E8EDF4';
+  for (const i of [11,12,13,14,15,16,23,24,25,26,27,28]){
+    ctx.beginPath(); ctx.arc(lm[i].x*cv.width, lm[i].y*cv.height, 4, 0, Math.PI*2); ctx.fill();
+  }
+}
+
+function setState(txt, cls){
+  const el = document.getElementById('state');
+  el.textContent = txt;
+  el.className = 'state' + (cls ? ' '+cls : '');
+}
+
+// ---- loop -----------------------------------------------------------------
+function loop(){
+  if (!running) return;
+  if (vid.currentTime !== lastT && landmarker && vid.videoWidth){
+    lastT = vid.currentTime;
+    const res = landmarker.detectForVideo(vid, performance.now());
+    if (res.landmarks && res.landmarks.length){
+      const lm = res.landmarks[0];
+      draw(lm);
+      const f = snapshot(lm);
+      if (Number.isFinite(f.elbow)){
+        segment(f);
+        setState(phase === 'idle' ? 'Tracking' : 'Shot in progress',
+                 phase === 'idle' ? 'armed' : 'live');
+      }
+    } else {
+      setState('No body detected', '');
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+// ---- wiring ---------------------------------------------------------------
+document.getElementById('start').addEventListener('click', async e => {
+  const btn = e.currentTarget;
+  btn.disabled = true; btn.textContent = 'Loading model…';
+  try{
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    landmarker = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions:{
+        modelAssetPath:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+        delegate:"GPU"
+      },
+      runningMode:"VIDEO", numPoses:1
+    });
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video:{ width:{ideal:1280}, height:{ideal:960}, facingMode:"environment" }
+    });
+    vid.srcObject = stream;
+    await vid.play();
+    document.getElementById('hint').style.display = 'none';
+    btn.textContent = 'Running';
+    running = true; setState('Tracking','armed'); loop();
+  }catch(err){
+    btn.disabled = false; btn.textContent = 'Start camera';
+    setState('Camera or model failed to load','');
+    document.getElementById('hint').innerHTML =
+      "Couldn't start. Camera access needs HTTPS and permission — check the browser prompt, then try again.<br><br><code>"+err.message+"</code>";
+  }
+});
+
+document.getElementById('hand').addEventListener('change', e => hand = e.target.value);
+
+function mark(result){
+  const last = shots[shots.length-1];
+  if (!last) return;
+  last.result = result;
+  document.getElementById('make').disabled = true;
+  document.getElementById('miss').disabled = true;
+  drawScatter(); drawList(); drawTally();
+}
+document.getElementById('make').addEventListener('click', ()=>mark('make'));
+document.getElementById('miss').addEventListener('click', ()=>mark('miss'));
+
+document.getElementById('clear').addEventListener('click', ()=>{
+  shots = []; buffer = []; phase = 'idle';
+  ['elbow','knee','fore','rel','sh','drift'].forEach(id=>{
+    document.getElementById('m-'+id).textContent = '—';
+    document.getElementById('m-'+id).classList.remove('off');
+    document.getElementById('d-'+id).textContent = '';
+  });
+  document.getElementById('spread').textContent = '—';
+  drawScatter(); drawList(); drawTally();
+});
+
+document.getElementById('export').addEventListener('click', ()=>{
+  if (!shots.length) return;
+  const head = 'shot,elbow_dip_deg,knee_dip_deg,forearm_from_vert_deg,release_height_torso,release_x_torso,shoulder_release_deg,elbow_drift_torso,result';
+  const rows = shots.map(s=>[s.n,s.elbow,s.knee,s.forearm,s.relH,s.relX,s.shoulder,s.drift,s.result??'']
+    .map(v=>typeof v==='number'?v.toFixed(4):v).join(','));
+  const blob = new Blob([[head,...rows].join('\n')],{type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'form-lab-session.csv';
+  a.click();
+});
+
+window.addEventListener('resize', drawScatter);
+drawScatter();
+</script>
