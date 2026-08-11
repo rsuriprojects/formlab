@@ -109,6 +109,8 @@
   #histlist .shot{grid-template-columns:1fr 34px 42px 50px 22px}
   .del{cursor:pointer;color:var(--dim);text-align:center}
   .del:hover{color:var(--bad)}
+  .shot.tap{cursor:pointer}
+  .shot.tap:hover{background:rgba(255,176,32,.07)}
 
   .shots{max-height:190px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px}
   .shot{display:grid;grid-template-columns:26px 1fr 1fr 1fr 42px;gap:6px;padding:5px 0;border-bottom:1px solid rgba(31,46,64,.5)}
@@ -140,18 +142,13 @@
       </div>
       <div class="controls">
         <button class="primary" id="start">Start camera</button>
-        <label class="filebtn" for="file">Load video file</label>
+        <label class="filebtn" for="file">Load video</label>
         <input type="file" id="file" accept="video/*">
         <select id="hand">
           <option value="right">Right-handed</option>
           <option value="left">Left-handed</option>
         </select>
-        <button class="make" id="make" disabled>Last was a make</button>
-        <button class="miss" id="miss" disabled>Last was a miss</button>
         <button id="voice">🎤 Voice off</button>
-        <button id="block">Log a set</button>
-        <button id="clear">Clear session</button>
-        <button id="export">Export CSV</button>
       </div>
       <div class="controls" id="scrub" style="display:none">
         <button id="replay">Replay from start</button>
@@ -167,6 +164,11 @@
     <div>
       <div class="panel">
         <h2>Last shot</h2>
+        <div class="controls" style="margin:0 0 14px">
+          <button class="make" id="make" disabled>Make</button>
+          <button class="miss" id="miss" disabled>Miss</button>
+          <button id="undo">Undo</button>
+        </div>
         <div class="metric"><span class="label">Elbow flexion at dip</span><span><span class="val" id="m-elbow">—</span><span class="delta" id="d-elbow"></span></span></div>
         <div class="metric"><span class="label">Knee flexion at dip</span><span><span class="val" id="m-knee">—</span><span class="delta" id="d-knee"></span></span></div>
         <div class="metric"><span class="label">Forearm from vertical</span><span><span class="val" id="m-fore">—</span><span class="delta" id="d-fore"></span></span></div>
@@ -196,13 +198,20 @@
           <div class="shot head"><span>#</span><span>Elbow</span><span>Knee</span><span>Rel ht</span><span>Res</span></div>
           <div id="shotlist"></div>
         </div>
+        <div class="note" style="margin-top:8px">Tap any row to change its label — it cycles make → miss → unlabeled.</div>
         <div class="controls" style="margin-top:14px">
-          <input id="sesname" placeholder="Label this session (e.g. focused, rushed, hot)"
-                 style="flex:1;min-width:180px;background:var(--panel);color:var(--chalk);
+          <input id="sesname" placeholder="Label this session (focused, rushed, hot…)"
+                 style="flex:1;min-width:170px;background:var(--panel);color:var(--chalk);
                         border:1px solid var(--line);padding:11px;border-radius:3px;
                         font-family:'Inter',sans-serif;font-size:13px">
           <button id="save">Save session</button>
         </div>
+        <div class="controls" style="margin-top:8px">
+          <button id="block">Label a whole set</button>
+          <button id="export">Export CSV</button>
+          <button id="clear">Clear</button>
+        </div>
+        <div class="note"><b>Label a whole set</b> is the no-voice fallback: shoot 10, walk over once, type how many went in. It fills in every unlabeled shot at once instead of you tapping after each rep.</div>
       </div>
 
       <div class="panel">
@@ -457,13 +466,16 @@ function drawTally(){
 
 function drawList(){
   document.getElementById('shotlist').innerHTML = shots.slice().reverse().map(s=>`
-    <div class="shot">
+    <div class="shot tap" data-n="${s.n}">
       <span>${s.n}</span>
       <span>${Number.isFinite(s.elbow)?s.elbow.toFixed(0)+'°':'—'}</span>
       <span>${Number.isFinite(s.knee)?s.knee.toFixed(0)+'°':'—'}</span>
       <span>${Number.isFinite(s.relH)?s.relH.toFixed(2):'—'}</span>
       <span class="${s.result==='make'?'m':s.result==='miss'?'x':''}">${s.result==='make'?'●':s.result==='miss'?'○':'·'}</span>
     </div>`).join('');
+  document.querySelectorAll('#shotlist .tap').forEach(el=>{
+    el.addEventListener('click', ()=>cycleShot(Number(el.dataset.n)));
+  });
 }
 
 function drawScatter(){
@@ -717,8 +729,9 @@ function mark(result){
   drawScatter(); drawList(); drawTally();
   return target;
 }
-document.getElementById('make').addEventListener('click', ()=>mark('make'));
-document.getElementById('miss').addEventListener('click', ()=>mark('miss'));
+document.getElementById('make').addEventListener('click', ()=>{ if(mark('make')) confirmLabel('make'); });
+document.getElementById('miss').addEventListener('click', ()=>{ if(mark('miss')) confirmLabel('miss'); });
+document.getElementById('undo').addEventListener('click', undoLabel);
 
 // ---- voice labeling -------------------------------------------------------
 // Walking back to the phone after every rep is why the first session ended up
@@ -727,28 +740,88 @@ document.getElementById('miss').addEventListener('click', ()=>mark('miss'));
 let recog = null, voiceOn = false;
 let audioCtx = null;
 
-function beep(freq, ms){
+function beep(freq, ms, vol){
   try{
     audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const t = audioCtx.currentTime;
     const o = audioCtx.createOscillator(), g = audioCtx.createGain();
-    o.frequency.value = freq; o.type = 'sine';
-    g.gain.setValueAtTime(0.18, audioCtx.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + ms/1000);
+    // square cuts through outdoor noise far better than a sine at the same volume
+    o.type = 'square';
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(vol ?? 0.8, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + ms/1000);
     o.connect(g); g.connect(audioCtx.destination);
-    o.start(); o.stop(audioCtx.currentTime + ms/1000);
+    o.start(t); o.stop(t + ms/1000);
   }catch(e){}
 }
 
+// Two distinct patterns you can tell apart from 25 feet without looking:
+// make  = two quick high chirps
+// miss  = one long low buzz
+function chime(kind){
+  if (kind === 'make'){ beep(1180, 110); setTimeout(()=>beep(1480,140), 130); }
+  else { beep(240, 300); }
+  if (navigator.vibrate) navigator.vibrate(kind === 'make' ? [60,50,60] : [200]);
+}
+
+// Spoken confirmation carries much further than a tone and tells you the count,
+// so you know it registered AND where you stand without walking back.
+let speakOn = true;
+function say(text){
+  if (!speakOn || !window.speechSynthesis) return;
+  try{
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1.05; u.volume = 1; u.pitch = 1;
+    speechSynthesis.speak(u);
+  }catch(e){}
+}
+
+function confirmLabel(kind){
+  chime(kind);
+  const done = shots.filter(s=>s.result);
+  const made = done.filter(s=>s.result==='make').length;
+  say(`${kind === 'make' ? 'Make' : 'Miss'}. ${made} of ${done.length}.`);
+}
+
 // generous synonyms — you will not say the exact word every time from 20 feet
-const MAKE_WORDS = ['make','made','makes','in','yes','good','bucket','swish','cash','money','count'];
-const MISS_WORDS = ['miss','missed','misses','no','off','brick','out','nope'];
+const MAKE_WORDS = ['make','made','makes','in','yes','good','bucket','swish','cash','money','count','yeah','yep'];
+const MISS_WORDS = ['miss','missed','misses','no','off','brick','out','nope','nah','bricked'];
+const UNDO_WORDS = ['undo','scratch','oops','wrong','cancel','redo'];
 
 function heard(text){
   const words = text.toLowerCase().replace(/[^a-z ]/g,'').split(/\s+/);
   for (const w of words){
-    if (MAKE_WORDS.includes(w)){ if (mark('make')) beep(880,120); return; }
-    if (MISS_WORDS.includes(w)){ if (mark('miss')) beep(300,160); return; }
+    if (UNDO_WORDS.includes(w)){ undoLabel(); return; }
+    if (MAKE_WORDS.includes(w)){ if (mark('make')) confirmLabel('make'); return; }
+    if (MISS_WORDS.includes(w)){ if (mark('miss')) confirmLabel('miss'); return; }
   }
+}
+
+// ---- corrections ----------------------------------------------------------
+// Say "undo" or tap any row in the shot list to fix a wrong label.
+function undoLabel(){
+  for (let i = shots.length-1; i >= 0; i--){
+    if (shots[i].result !== null){
+      shots[i].result = null; shots[i].setLevel = false;
+      beep(520, 200);
+      say('Undone.');
+      drawScatter(); drawList(); drawTally();
+      document.getElementById('make').disabled = false;
+      document.getElementById('miss').disabled = false;
+      return;
+    }
+  }
+}
+
+// cycle a specific shot: unlabeled -> make -> miss -> unlabeled
+function cycleShot(n){
+  const s = shots.find(x=>x.n === n);
+  if (!s) return;
+  s.result = s.result === null ? 'make' : s.result === 'make' ? 'miss' : null;
+  s.setLevel = false;
+  drawScatter(); drawList(); drawTally();
 }
 
 function setVoiceUI(on, msg){
@@ -757,8 +830,8 @@ function setVoiceUI(on, msg){
   b.style.borderColor = on ? 'var(--good)' : 'var(--line)';
   b.style.color = on ? 'var(--good)' : 'var(--chalk)';
   const v = document.getElementById('voicehint');
-  if (v) v.textContent = msg || (on
-    ? 'Say "make" or "miss" after each shot. High beep = make, low beep = miss.'
+  if (v) v.innerHTML = msg || (on
+    ? 'Say <b>make</b> or <b>miss</b> after each shot — or <b>undo</b> to fix the last one. It beeps and speaks the running count back to you.<br><b>No sound?</b> Check the physical silent switch on the side of your phone — iOS mutes browser audio when it\'s flipped, no matter the volume.'
     : 'Voice labeling is off.');
 }
 
@@ -790,7 +863,11 @@ document.getElementById('voice').addEventListener('click', ()=>{
     }
   };
   try{
-    recog.start(); voiceOn = true; setVoiceUI(true); beep(660,90);
+    // iOS blocks audio until it's started inside a user gesture — do it here
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    say('Voice on.');
+    recog.start(); voiceOn = true; setVoiceUI(true); beep(880,150);
   }catch(err){
     setVoiceUI(false, 'Could not start: ' + err.message);
   }
