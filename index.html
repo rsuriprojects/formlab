@@ -149,6 +149,10 @@
           <option value="left">Left-handed</option>
         </select>
         <button id="voice">🎤 Voice off</button>
+        <button id="speak">Count aloud: off</button>
+      </div>
+      <div class="note" style="margin-top:8px">
+        Performance: <span id="perf" style="font-family:'JetBrains Mono',monospace;color:var(--amber)">—</span>
       </div>
       <div class="controls" id="scrub" style="display:none">
         <button id="replay">Replay from start</button>
@@ -556,12 +560,36 @@ function setState(txt, cls){
 }
 
 // ---- loop -----------------------------------------------------------------
+// Pose inference is expensive and runs on the main thread. On a phone that's
+// also decoding video, listening on the mic, and running speech recognition,
+// trying to hit 60fps starves everything else and the preview stalls. Cap the
+// detection rate and adapt it to how long inference is actually taking.
+let targetGap = 45;          // ms between detections (~22fps) — plenty for shots
+let lastDetect = 0;
+let fpsAvg = 0, inferAvg = 0;
+
 function loop(){
   if (!running) return;
-  if (vid.currentTime !== lastT && landmarker && vid.videoWidth){
-    lastT = vid.currentTime;
-    const res = landmarker.detectForVideo(vid, performance.now());
-    if (res.landmarks && res.landmarks.length){
+  const now = performance.now();
+
+  if (now - lastDetect >= targetGap && vid.currentTime !== lastT && landmarker && vid.videoWidth){
+    const gap = now - lastDetect;
+    lastDetect = now; lastT = vid.currentTime;
+
+    const t0 = performance.now();
+    let res = null;
+    try{ res = landmarker.detectForVideo(vid, now); }
+    catch(e){ /* transient decode hiccup — skip this frame */ }
+    const infer = performance.now() - t0;
+
+    inferAvg = inferAvg ? inferAvg*0.9 + infer*0.1 : infer;
+    fpsAvg   = fpsAvg   ? fpsAvg*0.9 + (1000/gap)*0.1 : 1000/gap;
+
+    // if inference is slow, back off so the UI thread can breathe
+    if (inferAvg > 55 && targetGap < 100) targetGap += 5;
+    else if (inferAvg < 25 && targetGap > 40) targetGap -= 2;
+
+    if (res && res.landmarks && res.landmarks.length){
       const lm = res.landmarks[0];
       draw(lm);
       const f = snapshot(lm);
@@ -570,9 +598,12 @@ function loop(){
         setState(phase === 'rising' ? 'Shot in progress' : 'Tracking',
                  phase === 'rising' ? 'live' : 'armed');
       }
-    } else {
+    } else if (res){
       setState('No body detected', '');
     }
+
+    const perf = document.getElementById('perf');
+    if (perf) perf.textContent = `${fpsAvg.toFixed(0)} fps · ${inferAvg.toFixed(0)}ms inference`;
   }
   requestAnimationFrame(loop);
 }
@@ -581,12 +612,18 @@ function loop(){
 let modelReady = null;
 function loadModel(){
   if (modelReady) return modelReady;
+  // The full model costs roughly twice the inference time of lite. On a phone
+  // already juggling camera, mic, and speech recognition that difference is
+  // the gap between smooth and stalling — and lite is accurate enough for
+  // joint angles at this scale.
+  const isPhone = /iPhone|iPad|Android/i.test(navigator.userAgent);
+  const variant = isPhone ? 'lite' : 'full';
   modelReady = (async ()=>{
     const vision = await FilesetResolver.forVisionTasks(
       "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
     landmarker = await PoseLandmarker.createFromOptions(vision, {
       baseOptions:{
-        modelAssetPath:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+        modelAssetPath:`https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_${variant}/float16/1/pose_landmarker_${variant}.task`,
         delegate:"GPU"
       },
       runningMode:"VIDEO", numPoses:1
@@ -641,7 +678,8 @@ document.getElementById('start').addEventListener('click', async e => {
   try{
     await loadModel();
     const stream = await navigator.mediaDevices.getUserMedia({
-      video:{ width:{ideal:1280}, height:{ideal:960}, facingMode:"environment" }
+      // 720p is ample for pose landmarks and roughly half the decode cost of 960p
+      video:{ width:{ideal:960}, height:{ideal:720}, frameRate:{ideal:30}, facingMode:"environment" }
     });
     vid.srcObject = stream;
     vid.loop = false; vid.muted = true; vid.controls = false;
@@ -733,6 +771,13 @@ document.getElementById('make').addEventListener('click', ()=>{ if(mark('make'))
 document.getElementById('miss').addEventListener('click', ()=>{ if(mark('miss')) confirmLabel('miss'); });
 document.getElementById('undo').addEventListener('click', undoLabel);
 
+document.getElementById('speak').addEventListener('click', e => {
+  speakOn = !speakOn;
+  e.currentTarget.textContent = 'Count aloud: ' + (speakOn ? 'on' : 'off');
+  e.currentTarget.style.borderColor = speakOn ? 'var(--amber)' : 'var(--line)';
+  if (speakOn) say('On');
+});
+
 // ---- voice labeling -------------------------------------------------------
 // Walking back to the phone after every rep is why the first session ended up
 // half-labeled. Say the word instead. Browser SpeechRecognition does the work;
@@ -767,7 +812,9 @@ function chime(kind){
 
 // Spoken confirmation carries much further than a tone and tells you the count,
 // so you know it registered AND where you stand without walking back.
-let speakOn = true;
+// Speaking while the mic is live makes iOS juggle the audio session, which can
+// stall the camera stream. Off by default; the beep alone is enough feedback.
+let speakOn = false;
 function say(text){
   if (!speakOn || !window.speechSynthesis) return;
   try{
@@ -779,10 +826,14 @@ function say(text){
 }
 
 function confirmLabel(kind){
-  chime(kind);
-  const done = shots.filter(s=>s.result);
-  const made = done.filter(s=>s.result==='make').length;
-  say(`${kind === 'make' ? 'Make' : 'Miss'}. ${made} of ${done.length}.`);
+  chime(kind);                       // instant — this is your real feedback
+  // Speech synthesis takes a moment to spin up and would otherwise hold the
+  // beep back, so it's deferred and treated as a bonus, not the confirmation.
+  setTimeout(()=>{
+    const done = shots.filter(s=>s.result);
+    const made = done.filter(s=>s.result==='make').length;
+    say(`${made} of ${done.length}`);
+  }, 260);
 }
 
 // generous synonyms — you will not say the exact word every time from 20 feet
@@ -790,13 +841,25 @@ const MAKE_WORDS = ['make','made','makes','in','yes','good','bucket','swish','ca
 const MISS_WORDS = ['miss','missed','misses','no','off','brick','out','nope','nah','bricked'];
 const UNDO_WORDS = ['undo','scratch','oops','wrong','cancel','redo'];
 
+let utteranceHandled = false;
+let lastFireAt = 0;
+
 function heard(text){
+  // hard cooldown: interim streams can slip a duplicate past the utterance lock
+  if (performance.now() - lastFireAt < 900) return false;
   const words = text.toLowerCase().replace(/[^a-z ]/g,'').split(/\s+/);
   for (const w of words){
-    if (UNDO_WORDS.includes(w)){ undoLabel(); return; }
-    if (MAKE_WORDS.includes(w)){ if (mark('make')) confirmLabel('make'); return; }
-    if (MISS_WORDS.includes(w)){ if (mark('miss')) confirmLabel('miss'); return; }
+    if (UNDO_WORDS.includes(w)){ lastFireAt = performance.now(); undoLabel(); return true; }
+    if (MAKE_WORDS.includes(w)){
+      if (mark('make')){ lastFireAt = performance.now(); confirmLabel('make'); return true; }
+      return false;
+    }
+    if (MISS_WORDS.includes(w)){
+      if (mark('miss')){ lastFireAt = performance.now(); confirmLabel('miss'); return true; }
+      return false;
+    }
   }
+  return false;
 }
 
 // ---- corrections ----------------------------------------------------------
@@ -847,15 +910,26 @@ document.getElementById('voice').addEventListener('click', ()=>{
   }
   recog = new SR();
   recog.continuous = true;
-  recog.interimResults = false;
+  // Interim results are the whole latency fix. With them off, recognition waits
+  // for you to stop talking AND for the server to finalize — usually 1-2s.
+  // Interim partials stream back in a few hundred ms, so we act on the first
+  // one that contains a keyword and then lock out the rest of that utterance.
+  recog.interimResults = true;
+  recog.maxAlternatives = 1;
   recog.lang = 'en-US';
+  // Interim partials arrive repeatedly as you speak ("ma", "make", "make it"),
+  // so without a lockout one word would fire the handler several times.
   recog.onresult = e => {
     for (let i = e.resultIndex; i < e.results.length; i++){
-      heard(e.results[i][0].transcript);
+      if (utteranceHandled) continue;
+      if (heard(e.results[i][0].transcript)) utteranceHandled = true;
     }
   };
+  // a pause in speech means the next sound is a new utterance — unlock
+  recog.onspeechend = () => { utteranceHandled = false; };
+  recog.onaudioend  = () => { utteranceHandled = false; };
   // recognition drops out on its own every 30-60s; restart it while voiceOn
-  recog.onend = () => { if (voiceOn){ try{ recog.start(); }catch(e){} } };
+  recog.onend = () => { utteranceHandled = false; if (voiceOn){ try{ recog.start(); }catch(e){} } };
   recog.onerror = ev => {
     if (ev.error === 'not-allowed'){
       voiceOn = false;
@@ -866,7 +940,6 @@ document.getElementById('voice').addEventListener('click', ()=>{
     // iOS blocks audio until it's started inside a user gesture — do it here
     audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
     if (audioCtx.state === 'suspended') audioCtx.resume();
-    say('Voice on.');
     recog.start(); voiceOn = true; setVoiceUI(true); beep(880,150);
   }catch(err){
     setVoiceUI(false, 'Could not start: ' + err.message);
