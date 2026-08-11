@@ -67,6 +67,12 @@
     color:rgba(255,255,255,.30);letter-spacing:.02em;
     text-shadow:0 2px 24px rgba(0,0,0,.6);
   }
+  .heard{
+    position:absolute;bottom:10px;left:10px;right:10px;z-index:7;
+    font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--amber);
+    background:rgba(10,16,24,.8);padding:5px 9px;border-radius:2px;
+    pointer-events:none;overflow:hidden;white-space:nowrap;
+  }
   .state{
     position:absolute;top:10px;left:10px;z-index:5;
     font-family:'Oswald',sans-serif;letter-spacing:.16em;text-transform:uppercase;
@@ -148,6 +154,7 @@
         <div class="flash" id="flash"></div>
         <div class="bigcount" id="bigcount">0/0</div>
         <div class="state" id="state">Camera off</div>
+        <div class="heard" id="heard"></div>
         <div class="hint" id="hint">
           Set the phone or laptop on your <b>shooting-hand side</b>, roughly hip height,
           8–12 feet away.<br>Your whole body needs to be in frame.<br><br>
@@ -826,13 +833,30 @@ function confirmLabel(kind){
   if (c) c.textContent = `${made}/${done.length}`;
 }
 
+// If nothing has come back for a while the recognizer has probably died
+// quietly — Safari does this. Restart it rather than leaving voice dead.
+setInterval(()=>{
+  if (!voiceOn || !recog) return;
+  if (performance.now() - lastHeardAt > 12000){
+    lastHeardAt = performance.now();
+    try{ recog.stop(); }catch(e){}      // onend restarts it
+  }
+}, 4000);
+
+// Shows the last thing recognition actually heard, so a mis-hear is visible
+// instead of looking like the feature is broken.
+function showHeard(txt){
+  const el = document.getElementById('heard');
+  if (el) el.textContent = txt ? 'heard: "' + txt.trim().slice(0,40) + '"' : '';
+}
+
 // generous synonyms — you will not say the exact word every time from 20 feet
 const MAKE_WORDS = ['make','made','makes','in','yes','good','bucket','swish','cash','money','count','yeah','yep'];
 const MISS_WORDS = ['miss','missed','misses','no','off','brick','out','nope','nah','bricked'];
 const UNDO_WORDS = ['undo','scratch','oops','wrong','cancel','redo'];
 
-let utteranceHandled = false;
 let lastFireAt = 0;
+let lastHeardAt = 0;
 
 function heard(text){
   // hard cooldown: interim streams can slip a duplicate past the utterance lock
@@ -908,22 +932,30 @@ document.getElementById('voice').addEventListener('click', ()=>{
   recog.lang = 'en-US';
   // Interim partials arrive repeatedly as you speak ("ma", "make", "make it"),
   // so without a lockout one word would fire the handler several times.
+  // No per-utterance lock: iOS Safari doesn't reliably fire onspeechend, so a
+  // flag-based lock gets stuck true after the first word and silently kills
+  // every later command. The 900ms cooldown in heard() is enough on its own
+  // and cannot deadlock, because it's driven by the clock rather than events.
   recog.onresult = e => {
+    lastHeardAt = performance.now();
     for (let i = e.resultIndex; i < e.results.length; i++){
-      if (utteranceHandled) continue;
-      if (heard(e.results[i][0].transcript)) utteranceHandled = true;
+      const txt = e.results[i][0].transcript;
+      showHeard(txt);
+      if (heard(txt)) break;
     }
   };
-  // a pause in speech means the next sound is a new utterance — unlock
-  recog.onspeechend = () => { utteranceHandled = false; };
-  recog.onaudioend  = () => { utteranceHandled = false; };
   // recognition drops out on its own every 30-60s; restart it while voiceOn
-  recog.onend = () => { utteranceHandled = false; if (voiceOn){ try{ recog.start(); }catch(e){} } };
+  recog.onend = () => {
+    if (voiceOn){ try{ recog.start(); }catch(e){ setTimeout(()=>{ try{recog.start();}catch(e2){} }, 400); } }
+  };
   recog.onerror = ev => {
-    if (ev.error === 'not-allowed'){
+    if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed'){
       voiceOn = false;
       setVoiceUI(false, 'Microphone permission denied. Allow it in the browser prompt and try again.');
+      return;
     }
+    // 'no-speech', 'aborted', 'network' are routine — onend will restart us
+    showHeard('(' + ev.error + ')');
   };
   try{
     // iOS blocks audio until it's started inside a user gesture — do it here
