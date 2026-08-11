@@ -55,6 +55,18 @@
   }
   .filebtn:hover{border-color:var(--amber);color:var(--amber)}
 
+  .flash{
+    position:absolute;inset:0;z-index:8;pointer-events:none;
+    opacity:0;transition:opacity .12s ease-out;background:transparent;
+  }
+  .bigcount{
+    position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+    z-index:9;pointer-events:none;
+    font-family:'Oswald',sans-serif;font-weight:700;
+    font-size:clamp(56px,16vw,130px);line-height:1;
+    color:rgba(255,255,255,.30);letter-spacing:.02em;
+    text-shadow:0 2px 24px rgba(0,0,0,.6);
+  }
   .state{
     position:absolute;top:10px;left:10px;z-index:5;
     font-family:'Oswald',sans-serif;letter-spacing:.16em;text-transform:uppercase;
@@ -133,6 +145,8 @@
       <div class="stage">
         <video id="vid" autoplay playsinline muted></video>
         <canvas id="cv"></canvas>
+        <div class="flash" id="flash"></div>
+        <div class="bigcount" id="bigcount">0/0</div>
         <div class="state" id="state">Camera off</div>
         <div class="hint" id="hint">
           Set the phone or laptop on your <b>shooting-hand side</b>, roughly hip height,
@@ -148,8 +162,8 @@
           <option value="right">Right-handed</option>
           <option value="left">Left-handed</option>
         </select>
+        <button id="flip">Front camera</button>
         <button id="voice">🎤 Voice off</button>
-        <button id="speak">Count aloud: off</button>
       </div>
       <div class="note" style="margin-top:8px">
         Performance: <span id="perf" style="font-family:'JetBrains Mono',monospace;color:var(--amber)">—</span>
@@ -410,9 +424,7 @@ function finalize(buf){
 const rejected = {total:0, tooShort:0, noPeak:0, noLoad:0, noExtend:0, cooldown:0, badFrame:0};
 
 function flash(){
-  const el = document.querySelector('.stage');
-  el.style.outline = '3px solid var(--amber)';
-  setTimeout(()=>{ el.style.outline = 'none'; }, 220);
+  flashStage('#FFB020', 200);
   const r = document.getElementById('rejects');
   if (r) r.textContent = `${shots.length} accepted · ${rejected.total - shots.length} rejected`;
 }
@@ -460,12 +472,14 @@ function render(shot){
 }
 
 function drawTally(){
+  const bc = document.getElementById('bigcount');
   const done = shots.filter(s=>s.result !== null);
   const made = done.filter(s=>s.result === 'make').length;
   document.getElementById('t-total').textContent = shots.length;
   document.getElementById('t-made').textContent = made;
   document.getElementById('t-pct').textContent = done.length
     ? Math.round(made/done.length*100)+'%' : '—';
+  if (bc) bc.textContent = `${made}/${done.length}`;
 }
 
 function drawList(){
@@ -609,6 +623,10 @@ function loop(){
 }
 
 // ---- wiring ---------------------------------------------------------------
+// Front camera by default: the screen faces the same way the lens does, so the
+// confirmation flash and the running count are visible to you while you shoot.
+// The rear camera points at you but shows you the back of the phone.
+let facingMode = 'user';
 let modelReady = null;
 function loadModel(){
   if (modelReady) return modelReady;
@@ -677,13 +695,15 @@ document.getElementById('start').addEventListener('click', async e => {
   btn.disabled = true; btn.textContent = 'Loading model…';
   try{
     await loadModel();
+    if (vid.srcObject){ vid.srcObject.getTracks().forEach(t=>t.stop()); vid.srcObject = null; }
     const stream = await navigator.mediaDevices.getUserMedia({
       // 720p is ample for pose landmarks and roughly half the decode cost of 960p
-      video:{ width:{ideal:960}, height:{ideal:720}, frameRate:{ideal:30}, facingMode:"environment" }
+      video:{ width:{ideal:960}, height:{ideal:720}, frameRate:{ideal:30}, facingMode }
     });
     vid.srcObject = stream;
     vid.loop = false; vid.muted = true; vid.controls = false;
-    vid.classList.remove('unmirrored'); cv.classList.remove('unmirrored');
+    vid.classList.toggle('unmirrored', facingMode !== 'user');
+    cv.classList.toggle('unmirrored', facingMode !== 'user');
     await vid.play();
     document.getElementById('hint').style.display = 'none';
     document.getElementById('scrub').style.display = 'none';
@@ -703,6 +723,12 @@ document.getElementById('start').addEventListener('click', async e => {
 // Same pipeline, different pixel source. Filmed clips are usually NOT mirrored
 // the way a selfie feed is, so the mirror transform gets removed for files.
 let sourceIsFile = false;
+
+document.getElementById('flip').addEventListener('click', async e => {
+  facingMode = facingMode === 'user' ? 'environment' : 'user';
+  e.currentTarget.textContent = facingMode === 'user' ? 'Front camera' : 'Rear camera';
+  if (running && !sourceIsFile) document.getElementById('start').click();
+});
 
 document.getElementById('file').addEventListener('change', async e => {
   const f = e.target.files[0];
@@ -771,69 +797,33 @@ document.getElementById('make').addEventListener('click', ()=>{ if(mark('make'))
 document.getElementById('miss').addEventListener('click', ()=>{ if(mark('miss')) confirmLabel('miss'); });
 document.getElementById('undo').addEventListener('click', undoLabel);
 
-document.getElementById('speak').addEventListener('click', e => {
-  speakOn = !speakOn;
-  e.currentTarget.textContent = 'Count aloud: ' + (speakOn ? 'on' : 'off');
-  e.currentTarget.style.borderColor = speakOn ? 'var(--amber)' : 'var(--line)';
-  if (speakOn) say('On');
-});
 
 // ---- voice labeling -------------------------------------------------------
 // Walking back to the phone after every rep is why the first session ended up
 // half-labeled. Say the word instead. Browser SpeechRecognition does the work;
 // a short beep confirms so you never have to look at the screen.
 let recog = null, voiceOn = false;
-let audioCtx = null;
 
-function beep(freq, ms, vol){
-  try{
-    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-    if (audioCtx.state === 'suspended') audioCtx.resume();
-    const t = audioCtx.currentTime;
-    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
-    // square cuts through outdoor noise far better than a sine at the same volume
-    o.type = 'square';
-    o.frequency.value = freq;
-    g.gain.setValueAtTime(vol ?? 0.8, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + ms/1000);
-    o.connect(g); g.connect(audioCtx.destination);
-    o.start(t); o.stop(t + ms/1000);
-  }catch(e){}
-}
-
-// Two distinct patterns you can tell apart from 25 feet without looking:
-// make  = two quick high chirps
-// miss  = one long low buzz
-function chime(kind){
-  if (kind === 'make'){ beep(1180, 110); setTimeout(()=>beep(1480,140), 130); }
-  else { beep(240, 300); }
-  if (navigator.vibrate) navigator.vibrate(kind === 'make' ? [60,50,60] : [200]);
-}
-
-// Spoken confirmation carries much further than a tone and tells you the count,
-// so you know it registered AND where you stand without walking back.
-// Speaking while the mic is live makes iOS juggle the audio session, which can
-// stall the camera stream. Off by default; the beep alone is enough feedback.
-let speakOn = false;
-function say(text){
-  if (!speakOn || !window.speechSynthesis) return;
-  try{
-    speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    u.rate = 1.05; u.volume = 1; u.pitch = 1;
-    speechSynthesis.speak(u);
-  }catch(e){}
+// ---- confirmation feedback ------------------------------------------------
+// Audio is gone. Starting Web Audio on iOS re-negotiates the audio session
+// while the mic is captured for speech recognition, and that was killing the
+// camera stream — the beep and the freeze were the same bug.
+// Visual instead: the whole stage flashes, which reads from across a court
+// PROVIDED the screen faces you. That's why the front camera is the default.
+function flashStage(color, ms){
+  const el = document.getElementById('flash');
+  el.style.background = color;
+  el.style.opacity = '0.92';
+  clearTimeout(el._t);
+  el._t = setTimeout(()=>{ el.style.opacity = '0'; }, ms || 420);
 }
 
 function confirmLabel(kind){
-  chime(kind);                       // instant — this is your real feedback
-  // Speech synthesis takes a moment to spin up and would otherwise hold the
-  // beep back, so it's deferred and treated as a bonus, not the confirmation.
-  setTimeout(()=>{
-    const done = shots.filter(s=>s.result);
-    const made = done.filter(s=>s.result==='make').length;
-    say(`${made} of ${done.length}`);
-  }, 260);
+  flashStage(kind === 'make' ? '#3DD68C' : '#F2545B', 480);
+  const done = shots.filter(s=>s.result);
+  const made = done.filter(s=>s.result==='make').length;
+  const c = document.getElementById('bigcount');
+  if (c) c.textContent = `${made}/${done.length}`;
 }
 
 // generous synonyms — you will not say the exact word every time from 20 feet
@@ -868,8 +858,7 @@ function undoLabel(){
   for (let i = shots.length-1; i >= 0; i--){
     if (shots[i].result !== null){
       shots[i].result = null; shots[i].setLevel = false;
-      beep(520, 200);
-      say('Undone.');
+      flashStage('#7A8DA3', 340);
       drawScatter(); drawList(); drawTally();
       document.getElementById('make').disabled = false;
       document.getElementById('miss').disabled = false;
@@ -938,9 +927,7 @@ document.getElementById('voice').addEventListener('click', ()=>{
   };
   try{
     // iOS blocks audio until it's started inside a user gesture — do it here
-    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-    if (audioCtx.state === 'suspended') audioCtx.resume();
-    recog.start(); voiceOn = true; setVoiceUI(true); beep(880,150);
+    recog.start(); voiceOn = true; setVoiceUI(true); flashStage('#FFB020', 260);
   }catch(err){
     setVoiceUI(false, 'Could not start: ' + err.message);
   }
