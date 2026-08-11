@@ -145,6 +145,7 @@
         <button class="make" id="make" disabled>Last was a make</button>
         <button class="miss" id="miss" disabled>Last was a miss</button>
         <button id="voice">🎤 Voice off</button>
+        <button id="block">Log a set</button>
         <button id="clear">Clear session</button>
         <button id="export">Export CSV</button>
       </div>
@@ -559,6 +560,42 @@ function loadModel(){
   return modelReady;
 }
 
+// ---- block mode -----------------------------------------------------------
+// Fallback if voice won't cooperate: shoot a set, walk over once, enter how
+// many you made. You lose per-shot pairing but keep the session percentage,
+// and consistency analysis never needed labels anyway.
+document.getElementById('block').addEventListener('click', ()=>{
+  const open = shots.filter(s => s.result === null);
+  if (!open.length){ alert('No unlabeled shots yet.'); return; }
+  const raw = prompt(`${open.length} unlabeled shots in this set.\nHow many did you make?`);
+  if (raw === null) return;
+  const made = parseInt(raw, 10);
+  if (!Number.isFinite(made) || made < 0 || made > open.length){
+    alert(`Enter a number from 0 to ${open.length}.`); return;
+  }
+  // marked as set-level: counts toward the tally, flagged so analysis knows
+  // these aren't matched to specific shots
+  open.forEach((s,i)=>{ s.result = i < made ? 'make' : 'miss'; s.setLevel = true; });
+  drawScatter(); drawList(); drawTally();
+});
+
+// ---- keep the screen on ---------------------------------------------------
+// A phone propped on a tripod locks itself after a couple of minutes and the
+// whole session dies. Wake Lock prevents that. Supported in Safari 16.4+.
+let wakeLock = null;
+async function keepAwake(){
+  try{
+    if ('wakeLock' in navigator){
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', ()=>{ wakeLock = null; });
+    }
+  }catch(e){ /* denied or unsupported — session still works, screen may sleep */ }
+}
+// iOS drops the lock whenever the tab is backgrounded; take it back on return
+document.addEventListener('visibilitychange', ()=>{
+  if (document.visibilityState === 'visible' && running && !wakeLock) keepAwake();
+});
+
 function resetSegmenter(){
   buffer = []; phase = 'idle'; peaked = false; lastT = -1;
 }
@@ -580,6 +617,7 @@ document.getElementById('start').addEventListener('click', async e => {
     btn.textContent = 'Running'; sourceIsFile = false;
     resetSegmenter();
     running = true; setState('Tracking','armed'); loop();
+    keepAwake();
   }catch(err){
     btn.disabled = false; btn.textContent = 'Start camera';
     setState('Camera failed','');
@@ -751,8 +789,8 @@ document.getElementById('clear').addEventListener('click', ()=>{
 
 document.getElementById('export').addEventListener('click', ()=>{
   if (!shots.length) return;
-  const head = 'shot,elbow_dip_deg,knee_dip_deg,forearm_from_vert_deg,release_height_torso,release_x_torso,shoulder_release_deg,elbow_drift_torso,result';
-  const rows = shots.map(s=>[s.n,s.elbow,s.knee,s.forearm,s.relH,s.relX,s.shoulder,s.drift,s.result??'']
+  const head = 'shot,elbow_dip_deg,knee_dip_deg,forearm_from_vert_deg,release_height_torso,release_x_torso,shoulder_release_deg,elbow_drift_torso,result,label_type';
+  const rows = shots.map(s=>[s.n,s.elbow,s.knee,s.forearm,s.relH,s.relX,s.shoulder,s.drift,s.result??'',s.setLevel?'set':'shot']
     .map(v=>typeof v==='number'?v.toFixed(4):v).join(','));
   const blob = new Blob([[head,...rows].join('\n')],{type:'text/csv'});
   const a = document.createElement('a');
