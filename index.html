@@ -808,7 +808,7 @@ document.getElementById('hand').addEventListener('change', e => hand = e.target.
 // applied to the next shot that arrives. Previously an early "make" would fall
 // through to re-labelling an ALREADY-labelled shot: the flash fired, the count
 // never moved, and it looked like voice was broken when detection was.
-let pendingLabel = null, pendingAt = 0;
+let pendingLabel = null, pendingAt = 0, lastLabelAt = 0;
 const PENDING_MS = 9000;
 
 function mark(result){
@@ -818,15 +818,22 @@ function mark(result){
     if (shots[i].result === null){ target = shots[i]; break; }
   }
   if (!target){
-    // nothing to label — hold it for the next detected shot instead of
-    // silently overwriting an old one
+    // Nothing to label. Only queue this for the next shot if a label wasn't
+    // JUST applied — otherwise a straggling duplicate of the word you already
+    // said gets held and wrongly stamped on your next shot.
+    if (performance.now() - lastLabelAt < 3500){
+      const el = document.getElementById('heard');
+      if (el) el.textContent = 'duplicate ignored';
+      return null;
+    }
     pendingLabel = result; pendingAt = performance.now();
     flashStage('#7A8DA3', 300);
     const el = document.getElementById('heard');
-    if (el) el.textContent = `"${result}" held — waiting for a shot to be detected`;
+    if (el) el.textContent = `"${result}" held — waiting for a shot`;
     return null;
   }
   target.result = result;
+  lastLabelAt = performance.now();
   document.getElementById('make').disabled = true;
   document.getElementById('miss').disabled = true;
   drawScatter(); drawList(); drawTally();
@@ -839,6 +846,7 @@ function applyPending(shot){
   if (performance.now() - pendingAt > PENDING_MS){ pendingLabel = null; return false; }
   shot.result = pendingLabel;
   pendingLabel = null;
+  lastLabelAt = performance.now();
   return true;
 }
 document.getElementById('make').addEventListener('click', ()=>{ if(mark('make')) confirmLabel('make'); });
@@ -904,10 +912,11 @@ const UNDO_WORDS = ['undo','scratch','oops','wrong','cancel','redo'];
 let lastFireAt = 0;
 let lastHeardAt = 0;
 let recogRestarting = false;
+let handledUpTo = -1;
 
 function heard(text){
   // hard cooldown: interim streams can slip a duplicate past the utterance lock
-  if (performance.now() - lastFireAt < 900) return false;
+  if (performance.now() - lastFireAt < 1800) return false;
   const words = text.toLowerCase().replace(/[^a-z ]/g,'').split(/\s+/);
   for (const w of words){
     if (UNDO_WORDS.includes(w)){ lastFireAt = performance.now(); undoLabel(); return true; }
@@ -983,17 +992,25 @@ document.getElementById('voice').addEventListener('click', ()=>{
   // flag-based lock gets stuck true after the first word and silently kills
   // every later command. The 900ms cooldown in heard() is enough on its own
   // and cannot deadlock, because it's driven by the clock rather than events.
+  // Each utterance keeps ONE index in e.results while it upgrades from interim
+  // guess to final transcript. Acting once per index dedupes exactly, which a
+  // time-based cooldown cannot: the final result routinely lands more than a
+  // second after the interim, slipping through and double-labelling.
   recog.onresult = e => {
     lastHeardAt = performance.now();
     for (let i = e.resultIndex; i < e.results.length; i++){
+      if (i <= handledUpTo) continue;
       const txt = e.results[i][0].transcript;
       showHeard(txt);
-      if (heard(txt)) break;
+      if (heard(txt)){ handledUpTo = i; break; }
+      // a final result with no keyword is done being revised — retire it
+      if (e.results[i].isFinal) handledUpTo = i;
     }
   };
   // recognition drops out on its own every 30-60s; restart it while voiceOn
   recog.onend = () => {
     recogRestarting = false;
+    handledUpTo = -1;               // result indices reset with the new session
     if (voiceOn){
       try{ recog.start(); }
       catch(e){ setTimeout(()=>{ try{ recog.start(); }catch(e2){} }, 400); }
