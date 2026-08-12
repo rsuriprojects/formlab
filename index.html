@@ -63,9 +63,11 @@
     position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
     z-index:9;pointer-events:none;
     font-family:'Oswald',sans-serif;font-weight:700;
-    font-size:clamp(56px,16vw,130px);line-height:1;
-    color:rgba(255,255,255,.30);letter-spacing:.02em;
-    text-shadow:0 2px 24px rgba(0,0,0,.6);
+    font-size:clamp(64px,18vw,150px);line-height:1;
+    color:#FFFFFF;letter-spacing:.02em;
+    -webkit-text-stroke:3px rgba(10,16,24,.9);
+    paint-order:stroke fill;
+    text-shadow:0 3px 18px rgba(0,0,0,.95), 0 0 44px rgba(0,0,0,.8);
   }
   .heard{
     position:absolute;bottom:10px;left:10px;right:10px;z-index:7;
@@ -385,6 +387,7 @@ function segment(f){
 
 function finalize(buf){
   rejected.total++;
+  setTimeout(showRejects, 0);
 
   if (buf.length < GATE.minFrames){ rejected.tooShort++; return; }
   if (GATE.aboveHead && !peaked)  { rejected.noPeak++;   return; }
@@ -424,16 +427,33 @@ function finalize(buf){
     result: null
   };
   shots.push(shot);
+  const wasPending = applyPending(shot);
   render(shot);
-  flash();
+  if (wasPending) confirmLabel(shot.result); else flash();
 }
 
 const rejected = {total:0, tooShort:0, noPeak:0, noLoad:0, noExtend:0, cooldown:0, badFrame:0};
 
 function flash(){
   flashStage('#FFB020', 200);
+  showRejects();
+}
+
+// The detector rejecting everything looks identical to the detector being off.
+// Naming the dominant reason turns a mystery into a one-line fix.
+function showRejects(){
   const r = document.getElementById('rejects');
-  if (r) r.textContent = `${shots.length} accepted · ${rejected.total - shots.length} rejected`;
+  if (!r) return;
+  const miss = rejected.total - shots.length;
+  const why = [
+    ['no arm over head', rejected.noPeak],
+    ['elbow never loaded', rejected.noLoad],
+    ['elbow never extended', rejected.noExtend],
+    ['motion too short', rejected.tooShort],
+    ['body out of frame', rejected.badFrame]
+  ].sort((a,b)=>b[1]-a[1])[0];
+  r.textContent = `${shots.length} accepted · ${miss} rejected`
+    + (miss > 2 && why[1] > 0 ? ` — mostly: ${why[0]}` : '');
 }
 
 // ---- stats ----------------------------------------------------------------
@@ -784,21 +804,42 @@ vid.addEventListener('ended', ()=>{
 
 document.getElementById('hand').addEventListener('change', e => hand = e.target.value);
 
+// A label spoken before the detector has logged the shot gets held here and
+// applied to the next shot that arrives. Previously an early "make" would fall
+// through to re-labelling an ALREADY-labelled shot: the flash fired, the count
+// never moved, and it looked like voice was broken when detection was.
+let pendingLabel = null, pendingAt = 0;
+const PENDING_MS = 9000;
+
 function mark(result){
-  // label the most recent shot that doesn't have one yet, not blindly the last.
-  // if you say "make" a beat late and another shot already logged, this still
-  // lands on the right one.
+  // most recent shot without a label yet, looking back a few
   let target = null;
   for (let i = shots.length-1; i >= 0 && i >= shots.length-3; i--){
     if (shots[i].result === null){ target = shots[i]; break; }
   }
-  if (!target) target = shots[shots.length-1];
-  if (!target) return;
+  if (!target){
+    // nothing to label — hold it for the next detected shot instead of
+    // silently overwriting an old one
+    pendingLabel = result; pendingAt = performance.now();
+    flashStage('#7A8DA3', 300);
+    const el = document.getElementById('heard');
+    if (el) el.textContent = `"${result}" held — waiting for a shot to be detected`;
+    return null;
+  }
   target.result = result;
   document.getElementById('make').disabled = true;
   document.getElementById('miss').disabled = true;
   drawScatter(); drawList(); drawTally();
   return target;
+}
+
+// called by finalize() the moment a new shot is accepted
+function applyPending(shot){
+  if (!pendingLabel) return false;
+  if (performance.now() - pendingAt > PENDING_MS){ pendingLabel = null; return false; }
+  shot.result = pendingLabel;
+  pendingLabel = null;
+  return true;
 }
 document.getElementById('make').addEventListener('click', ()=>{ if(mark('make')) confirmLabel('make'); });
 document.getElementById('miss').addEventListener('click', ()=>{ if(mark('miss')) confirmLabel('miss'); });
@@ -835,13 +876,18 @@ function confirmLabel(kind){
 
 // If nothing has come back for a while the recognizer has probably died
 // quietly — Safari does this. Restart it rather than leaving voice dead.
+// The previous watchdog stopped recognition after 12s of silence, which is
+// normal between shots — so it fired constantly and every restart surfaced as
+// "(aborted)". Only intervene if recognition has produced nothing for a long
+// stretch AND isn't already restarting on its own.
 setInterval(()=>{
-  if (!voiceOn || !recog) return;
-  if (performance.now() - lastHeardAt > 12000){
+  if (!voiceOn || !recog || recogRestarting) return;
+  if (performance.now() - lastHeardAt > 45000){
     lastHeardAt = performance.now();
+    recogRestarting = true;
     try{ recog.stop(); }catch(e){}      // onend restarts it
   }
-}, 4000);
+}, 10000);
 
 // Shows the last thing recognition actually heard, so a mis-hear is visible
 // instead of looking like the feature is broken.
@@ -857,6 +903,7 @@ const UNDO_WORDS = ['undo','scratch','oops','wrong','cancel','redo'];
 
 let lastFireAt = 0;
 let lastHeardAt = 0;
+let recogRestarting = false;
 
 function heard(text){
   // hard cooldown: interim streams can slip a duplicate past the utterance lock
@@ -946,7 +993,11 @@ document.getElementById('voice').addEventListener('click', ()=>{
   };
   // recognition drops out on its own every 30-60s; restart it while voiceOn
   recog.onend = () => {
-    if (voiceOn){ try{ recog.start(); }catch(e){ setTimeout(()=>{ try{recog.start();}catch(e2){} }, 400); } }
+    recogRestarting = false;
+    if (voiceOn){
+      try{ recog.start(); }
+      catch(e){ setTimeout(()=>{ try{ recog.start(); }catch(e2){} }, 400); }
+    }
   };
   recog.onerror = ev => {
     if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed'){
@@ -954,8 +1005,9 @@ document.getElementById('voice').addEventListener('click', ()=>{
       setVoiceUI(false, 'Microphone permission denied. Allow it in the browser prompt and try again.');
       return;
     }
-    // 'no-speech', 'aborted', 'network' are routine — onend will restart us
-    showHeard('(' + ev.error + ')');
+    // 'no-speech' and 'aborted' happen constantly and mean nothing to you —
+    // surfacing them made a working recognizer look broken
+    if (ev.error === 'network') showHeard('(no network for speech)');
   };
   try{
     // iOS blocks audio until it's started inside a user gesture — do it here
